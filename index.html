@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>手語 LSTM 辨識</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Noto Sans TC", sans-serif; background: #0f172a; color: #e2e8f0;
+    display: flex; flex-direction: column; align-items: center; padding: 16px; gap: 14px; }
+  h1 { font-size: 1.3rem; color: #60a5fa; }
+  .sub { color: #94a3b8; font-size: 0.85rem; text-align: center; }
+  #dbg { color: #f59e0b; font-size: 0.8rem; text-align: center; min-height: 1.1em; }
+  #camera-wrap { position: relative; width: 100%; max-width: 560px; border-radius: 14px; overflow: hidden; }
+  canvas { width: 100%; height: auto; max-height: 70vh; display: block; background: #000; object-fit: contain; }
+  video { display: none; }
+  .panel { background: #1e293b; border-radius: 14px; padding: 18px; width: 100%; max-width: 560px; text-align: center; }
+  #result { font-size: 3.5rem; font-weight: bold; color: #4ade80; min-height: 1.2em; }
+  #conf { color: #94a3b8; font-size: 0.9rem; }
+  #allprobs { color: #64748b; font-size: 0.8rem; margin-top: 6px; }
+  button { font-size: 1rem; border-radius: 10px; border: none; padding: 12px 20px; cursor: pointer;
+    background: linear-gradient(135deg,#3b82f6,#6366f1); color: #fff; font-weight: bold; width: 100%; max-width: 560px; }
+  button:disabled { opacity: 0.5; }
+  #status { color: #94a3b8; font-size: 0.85rem; min-height: 1.3em; text-align: center; }
+  #countdown { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    font-size:5rem; font-weight:bold; color:#fbbf24; text-shadow:0 2px 8px rgba(0,0,0,.6); pointer-events:none; }
+  #recprogress { position:absolute; bottom:0; left:0; width:100%; height:8px; background:rgba(0,0,0,0.4); display:none; }
+  #recprogressbar { height:100%; width:0%; background:linear-gradient(90deg,#4ade80,#22d3ee); transition:width 0.05s linear; }
+</style>
+</head>
+<body>
+  <h1>🤟 手語 LSTM 即時辨識</h1>
+  <div class="sub">正規化 + LSTM · 支援：數字 1、5、10、11（靜態＋動態）</div>
+  <div id="dbg"></div>
+  <div id="camera-wrap">
+    <video id="video" playsinline></video>
+    <canvas id="canvas" width="640" height="480"></canvas>
+    <div id="countdown"></div>
+    <div id="recprogress"><div id="recprogressbar"></div></div>
+  </div>
+  <button id="btnStart" disabled>▶ 開始辨識（倒數後錄 2 秒）</button>
+  <div class="panel">
+    <div id="result">—</div>
+    <div id="conf"></div>
+    <div id="allprobs"></div>
+  </div>
+  <div id="status">載入中…</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.3.1675466124/drawing_utils.js" crossorigin="anonymous"></script>
+
+<script>
+let arch=null, weights=null, LABELS=null, FRAMES=60, DIM=126, USE_NORM=true;
+const NUM_POINTS=21;
+
+/* ===== 左右手標籤修正 =====
+   MediaPipe 的 Left/Right 標籤是依「畫面是否為自拍鏡像」推算的，
+   而手機前鏡頭與桌機 webcam 的原始影格鏡像方向常常不同，
+   會導致同一隻手在手機上被標成相反的 label，
+   使左手/右手資料被塞進錯誤的 63 維槽 → 例如「1」被誤判成「10」。
+
+   下面在手機上把標籤交換回來，與桌機（訓練時）慣例一致。
+   只交換「標籤」、不動座標，所以不會破壞模型特徵。
+
+   若確認方向猜反了（例如手機反而正確、桌機錯），
+   把這個判斷式改成你需要的條件即可（甚至設成固定 true/false 測試）。 */
+const IS_MOBILE = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+let SWAP_HANDS = IS_MOBILE;   // 手機預設交換左右手標籤
+
+// 從外部檔案載入模型
+async function loadModelFiles(){
+  try{
+    const [a, w] = await Promise.all([
+      fetch('model_arch.json').then(r=>r.json()),
+      fetch('model_weights.json').then(r=>r.json())
+    ]);
+    arch=a; weights=w; LABELS=a.labels; FRAMES=a.frames; DIM=a.dim; USE_NORM=(a.normalize===true);
+    return true;
+  }catch(e){
+    document.getElementById('status').textContent='❌ 模型載入失敗：'+e.message;
+    return false;
+  }
+}
+
+function normalizeFrame(frame){
+  const out=Float32Array.from(frame);
+  for(const hs of [0,63]){
+    let allZero=true;
+    for(let i=0;i<63;i++){ if(frame[hs+i]!==0){ allZero=false; break; } }
+    if(allZero) continue;
+    const wx=frame[hs],wy=frame[hs+1],wz=frame[hs+2];
+    const m9x=frame[hs+27],m9y=frame[hs+28],m9z=frame[hs+29];
+    const palm=Math.sqrt((m9x-wx)**2+(m9y-wy)**2+(m9z-wz)**2)+1e-6;
+    for(let p=0;p<21;p++){
+      out[hs+p*3]=(frame[hs+p*3]-wx)/palm;
+      out[hs+p*3+1]=(frame[hs+p*3+1]-wy)/palm;
+      out[hs+p*3+2]=(frame[hs+p*3+2]-wz)/palm;
+    }
+  }
+  return out;
+}
+function sigmoid(x){ return 1/(1+Math.exp(-Math.max(-30,Math.min(30,x)))); }
+function vecMat(v,M,m){ const o=new Float32Array(m); for(let j=0;j<m;j++){let s=0;for(let i=0;i<v.length;i++)s+=v[i]*M[i][j];o[j]=s;} return o; }
+function lstmForward(xSeq,kernel,rkernel,bias,units,retSeq){
+  let h=new Float32Array(units),c=new Float32Array(units);const outputs=[];
+  for(const x of xSeq){
+    const zx=vecMat(x,kernel,4*units),zh=vecMat(h,rkernel,4*units);
+    const z=new Float32Array(4*units);
+    for(let k=0;k<4*units;k++) z[k]=zx[k]+zh[k]+bias[k];
+    const nh=new Float32Array(units),nc=new Float32Array(units);
+    for(let u=0;u<units;u++){
+      const i=sigmoid(z[u]),f=sigmoid(z[units+u]),ch=Math.tanh(z[2*units+u]),o=sigmoid(z[3*units+u]);
+      nc[u]=f*c[u]+i*ch; nh[u]=o*Math.tanh(nc[u]);
+    }
+    h=nh;c=nc; if(retSeq) outputs.push(Float32Array.from(h));
+  }
+  return retSeq?outputs:h;
+}
+function predict(frames){
+  let x=USE_NORM?frames.map(normalizeFrame):frames;
+  for(const layer of arch.architecture){
+    if(layer.type==='LSTM'){
+      const w=weights[layer.name];
+      x=lstmForward(x,w[0],w[1],w[2],layer.units,layer.return_sequences);
+    }else if(layer.type==='Dense'){
+      const w=weights[layer.name],k=w[0],b=w[1];
+      const out=vecMat(x,k,layer.units);
+      for(let j=0;j<layer.units;j++){ out[j]+=b[j]; if(layer.activation==='relu') out[j]=Math.max(0,out[j]); }
+      x=out;
+    }
+  }
+  let mx=-Infinity; for(const v of x) mx=Math.max(mx,v);
+  let sum=0;const exps=[];
+  for(const v of x){ const e=Math.exp(v-mx); exps.push(e); sum+=e; }
+  return exps.map(e=>e/sum);
+}
+
+const video=document.getElementById('video'),canvas=document.getElementById('canvas'),ctx=canvas.getContext('2d');
+const statusEl=document.getElementById('status'),resultEl=document.getElementById('result');
+const confEl=document.getElementById('conf'),allEl=document.getElementById('allprobs');
+const btnStart=document.getElementById('btnStart'),countdownEl=document.getElementById('countdown');
+const dbgEl=document.getElementById('dbg');
+let latestFrame=null,isCapturing=false,captured=[];
+
+function packLandmarks(results){
+  const left=new Array(NUM_POINTS*3).fill(0),right=new Array(NUM_POINTS*3).fill(0);
+  if(results.multiHandLandmarks && results.multiHandedness){
+    for(let h=0;h<results.multiHandLandmarks.length;h++){
+      const lm=results.multiHandLandmarks[h];
+      let label=results.multiHandedness[h].label;
+      if(SWAP_HANDS) label=(label==='Left')?'Right':'Left';   // ← 手機標籤修正
+      const t=(label==='Left')?left:right;
+      for(let i=0;i<NUM_POINTS;i++){ t[i*3]=lm[i].x; t[i*3+1]=lm[i].y; t[i*3+2]=lm[i].z; }
+    }
+  }
+  return Float32Array.from(left.concat(right));
+}
+
+const hands=new Hands({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}`});
+hands.setOptions({maxNumHands:2,modelComplexity:1,minDetectionConfidence:0.7,minTrackingConfidence:0.6});
+hands.onResults(onResults);
+
+function onResults(results){
+  // 讓canvas尺寸符合實際影像比例，避免手機上變形
+  const iw = results.image.width, ih = results.image.height;
+  if(iw && ih && (canvas.width!==iw || canvas.height!==ih)){
+    canvas.width = iw;
+    canvas.height = ih;
+  }
+  ctx.save(); ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.translate(canvas.width,0); ctx.scale(-1,1);
+  ctx.drawImage(results.image,0,0,canvas.width,canvas.height);
+  if(results.multiHandLandmarks){
+    for(const lm of results.multiHandLandmarks){
+      drawConnectors(ctx,lm,HAND_CONNECTIONS,{color:'#38bdf8',lineWidth:3});
+      drawLandmarks(ctx,lm,{color:'#818cf8',radius:3});
+    }
+  }
+  ctx.restore();
+  latestFrame=packLandmarks(results);
+
+  // 除錯：待機時顯示 MediaPipe 原始 handedness（交換前），方便比對桌機/手機
+  if(!isCapturing){
+    if(results.multiHandedness && results.multiHandedness.length){
+      const labs=results.multiHandedness.map(h=>h.label).join(', ');
+      dbgEl.textContent='MediaPipe 判定：'+labs+(SWAP_HANDS?'（本裝置已交換左右手）':'');
+    }else{
+      dbgEl.textContent='';
+    }
+  }
+
+  if(isCapturing){
+    captured.push(latestFrame);
+    const pct=Math.min(captured.length/FRAMES*100,100);
+    document.getElementById('recprogressbar').style.width=pct+'%';
+    const remain=Math.max(0,(FRAMES-captured.length)/30).toFixed(1);
+    statusEl.textContent='比手勢中… 剩 '+remain+'s';
+    if(captured.length>=FRAMES) doPredict();
+  }
+}
+
+function doPredict(){
+  isCapturing=false; statusEl.textContent='辨識中…';
+  document.getElementById('recprogress').style.display='none';
+  const probs=predict(captured);
+  let maxI=0; for(let i=1;i<probs.length;i++) if(probs[i]>probs[maxI]) maxI=i;
+  resultEl.textContent=LABELS[maxI];
+  confEl.textContent='信心度 '+(probs[maxI]*100).toFixed(0)+'%';
+  allEl.textContent=LABELS.map((l,i)=>l+':'+(probs[i]*100).toFixed(0)+'%').join('  ');
+  statusEl.textContent='完成！可再按一次'; btnStart.disabled=false;
+}
+
+async function startCapture(){
+  btnStart.disabled=true; resultEl.textContent='…'; confEl.textContent=''; allEl.textContent='';
+  for(let c=3;c>0;c--){ countdownEl.textContent=c; await new Promise(r=>setTimeout(r,700)); }
+  countdownEl.textContent=''; captured=[]; isCapturing=true;
+  document.getElementById('recprogress').style.display='block';
+  document.getElementById('recprogressbar').style.width='0%';
+  statusEl.textContent='比手勢中…（2秒）';
+}
+btnStart.addEventListener('click',startCapture);
+
+// 啟動：先載入模型，再開攝影機
+(async function init(){
+  statusEl.textContent='載入 AI 模型中…';
+  const ok=await loadModelFiles();
+  if(!ok) return;
+  navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:640},height:{ideal:480}},audio:false})
+    .then(stream=>{
+      video.srcObject=stream; video.play();
+      video.addEventListener('loadeddata',()=>{
+        statusEl.textContent='✅ 模型已就緒，可以開始辨識';
+        btnStart.disabled=false;
+        async function loop(){ await hands.send({image:video}); requestAnimationFrame(loop); }
+        loop();
+      });
+    })
+    .catch(e=>statusEl.textContent='攝影機錯誤：'+e.message);
+})();
+
+/* ===== 若「交換標籤」後仍不準（另一種狀況） =====
+   如果用上面的除錯字比對後發現：桌機和手機對同一隻手顯示的 label 其實一樣，
+   但手機還是誤判 —— 那代表手機的原始影格連「座標」都被鏡像了
+   （不只是標籤，整個手形被左右翻）。此時光交換標籤沒用，
+   要在送入 MediaPipe 前，先把影像畫到一個水平翻轉的離屏 canvas，
+   讓兩個裝置的座標方向一致（注意這會同時改變特徵，需與訓練時方向相符）。
+   多數情況是標籤翻轉，先用上面的 SWAP_HANDS 即可。 */
+</script>
+</body>
+</html>
